@@ -357,6 +357,28 @@ def post_core_state(payload, endpoint=None, timeout=CORE_STATE_POST_TIMEOUT_S):
         return False
 
 
+def note_transition(last_state, state, detail, kind, session, state_dir,
+                    post=None, endpoint=None):
+    """Publish `last_state -> state` and return the new acknowledged state.
+
+    The monitor is launched by the host BEFORE the supervisor brings the collector
+    up, so the first (often only) transition would land on a closed port and be
+    lost for good. Advance `last_state` only once the collector accepted the
+    record — or when capture is off — so an unacknowledged transition is retried
+    on the next tick with the same `from`. Intermediate states skipped while the
+    collector was down collapse into one record, which is the honest floor."""
+    if state == last_state:
+        return last_state
+    base = endpoint or obs_endpoint()
+    if not base:
+        return state
+    payload = core_state_payload(
+        last_state, state, detail, kind, session,
+        gateway_auth_rejected=(state == "gateway-down" and gateway_auth_rejected(state_dir)))
+    ok = (post or post_core_state)(payload, endpoint=base)
+    return state if ok else last_state
+
+
 def gateway_auth_rejected(state_dir):
     """True when the bridge sidecar says its credential was refused: the initial
     auth rejection writes `connected: false` with `backoff_s: 0`; transport
@@ -707,13 +729,9 @@ def main():
             last_answered = None
 
         # Observability: one record per state transition (the first tick records
-        # the state the monitor found, from=None). Best-effort, see post_core_state.
-        if state != last_state:
-            post_core_state(core_state_payload(
-                last_state, state, detail, kind, a.session,
-                gateway_auth_rejected=(state == "gateway-down"
-                                       and gateway_auth_rejected(state_dir))))
-            last_state = state
+        # the state the monitor found, from=None), retried until the collector
+        # acknowledges it — see note_transition.
+        last_state = note_transition(last_state, state, detail, kind, a.session, state_dir)
 
         sig = (state, prompt, last_answered and last_answered["at"])
         if sig != last_sig:

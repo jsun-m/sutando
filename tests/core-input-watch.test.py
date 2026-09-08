@@ -633,6 +633,47 @@ class TestCoreStateEmitter(unittest.TestCase):
         self.assertFalse(_mod.gateway_auth_rejected(None))
         self.assertFalse(_mod.gateway_auth_rejected("/nonexistent/dir"))
 
+    def test_transition_is_retried_until_the_collector_acknowledges(self):
+        calls = []
+
+        def flaky(payload, endpoint=None):
+            calls.append(payload)
+            return len(calls) >= 3  # collector comes up on the third tick
+        ep = "http://localhost:4000"
+        # tick 1: first observation, collector down -> not acknowledged
+        last = _mod.note_transition(None, "logged-out", "d", None, "s", None, post=flaky, endpoint=ep)
+        self.assertIsNone(last)
+        # tick 2: same state, still down -> retried with the same from
+        last = _mod.note_transition(last, "logged-out", "d", None, "s", None, post=flaky, endpoint=ep)
+        self.assertIsNone(last)
+        # tick 3: accepted -> acknowledged
+        last = _mod.note_transition(last, "logged-out", "d", None, "s", None, post=flaky, endpoint=ep)
+        self.assertEqual(last, "logged-out")
+        self.assertEqual([(c["from"], c["to"]) for c in calls], [(None, "logged-out")] * 3)
+        # tick 4: no change -> no POST
+        last = _mod.note_transition(last, "logged-out", "d", None, "s", None, post=flaky, endpoint=ep)
+        self.assertEqual(len(calls), 3)
+
+    def test_transition_skipped_while_down_collapses_into_one_record(self):
+        calls = []
+        ep = "http://localhost:4000"
+        last = _mod.note_transition("running", "logged-out", "d", None, "s", None,
+                                    post=lambda p, endpoint=None: calls.append(p) or False, endpoint=ep)
+        self.assertEqual(last, "running")
+        last = _mod.note_transition(last, "idle-ready", "d", None, "s", None,
+                                    post=lambda p, endpoint=None: calls.append(p) or True, endpoint=ep)
+        self.assertEqual(last, "idle-ready")
+        self.assertEqual((calls[-1]["from"], calls[-1]["to"]), ("running", "idle-ready"))
+
+    def test_transition_without_endpoint_advances_without_posting(self):
+        from unittest.mock import patch
+        calls = []
+        with patch.dict(os.environ, {"SUTANDO_OBS_ENDPOINT": ""}):
+            last = _mod.note_transition(None, "running", "d", None, "s", None,
+                                        post=lambda p, endpoint=None: calls.append(p) or True)
+        self.assertEqual(last, "running")
+        self.assertEqual(calls, [])
+
     def test_main_once_posts_the_first_observed_state_from_none(self):
         import sys
         import tempfile
@@ -651,6 +692,7 @@ class TestCoreStateEmitter(unittest.TestCase):
                 patch.object(_mod, "gateway_alive", lambda *a: True), \
                 patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
                 patch.object(_mod, "post_core_state", lambda p, **kw: posted.append(p) or True), \
+                patch.dict(os.environ, {"SUTANDO_OBS_ENDPOINT": "http://localhost:4000"}), \
                 patch.object(sys, "argv", argv):
             main()
         self.assertEqual(len(posted), 1)
