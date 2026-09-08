@@ -379,6 +379,56 @@ def note_transition(last_state, state, detail, kind, session, state_dir,
     return state if ok else last_state
 
 
+# --- refused turns (per occurrence, not a state transition) --------------------
+# A logged-out core refuses every turn: the reason is the turn's `⎿` result and the
+# pane returns to the idle footer, so the supervisor STATE does not change. Each
+# such completed turn is its own record. The completed-turn line carries a
+# minute-resolution stamp, so identity is (stamp, completed turns visible).
+CORE_TURN_REFUSED_KIND = "core.turn_refused"
+_DONE_LINE = re.compile(r"^\s*✻\s+\S+(?:\s+for\s+\d+[hms](?:\s+\d+[hms])*)?\s*·\s*done\b.*$")
+_REFUSAL_LINE = re.compile(
+    r"Please run /login|not logged in|OAuth access token has expired"
+    r"|out of usage credits|/usage-credits|hit your (?:session|usage|weekly) limit", re.I)
+_TURN_LINES = 40
+
+
+def last_refused_turn(pane):
+    """((stamp, seen), line) for the newest completed turn when it is the last thing
+    above the idle footer and its only content is a `⎿` result carrying a refusal
+    line; else None. Agent output (`●`) or a tool call (`⏺`) in the turn means it
+    ran — a tool result quoting the words is that tool's, not the CLI's."""
+    if not pane or not _is_idle_ready(pane):
+        return None
+    lines = [ln.replace("\xa0", " ").rstrip() for ln in pane.splitlines() if ln.strip()][-_TURN_LINES:]
+    done = next((i for i in range(len(lines) - 1, -1, -1) if _DONE_LINE.match(lines[i])), None)
+    if done is None:
+        return None
+    for ln in lines[done + 1:]:
+        core = ln.strip()
+        if core[:1] in "●⏺⎿✻" or (core.startswith("❯") and core.lstrip("❯").strip()):
+            return None  # a newer prompt or turn owns the pane
+    start = next((i for i in range(done - 1, -1, -1) if lines[i].lstrip().startswith("❯")), -1)
+    turn = [ln.strip() for ln in lines[start + 1:done]]
+    if any(core[:1] in "●⏺" for core in turn):
+        return None
+    for core in turn:
+        if core.startswith("⎿") and _REFUSAL_LINE.search(core):
+            seen = sum(1 for ln in lines if _DONE_LINE.match(ln))
+            return (lines[done].strip(), seen), core.lstrip("⎿").strip()
+    return None
+
+
+def core_turn_payload(state, line, stamp, session, ts=None):
+    return {
+        "kind": CORE_TURN_REFUSED_KIND,
+        "ts": round(time.time() if ts is None else ts, 3),
+        "session": session,
+        "state": state,
+        "line": line,
+        "turn": stamp,
+    }
+
+
 def gateway_auth_rejected(state_dir):
     """True when the bridge sidecar says its credential was refused: the initial
     auth rejection writes `connected: false` with `backoff_s: 0`; transport
@@ -693,6 +743,8 @@ def main():
 
     last_sig = None
     last_state = None
+    last_turn = "unseen"  # first pane seeds identity; only turns completed while watching count
+    pending_turn = None
     state_dir = os.path.dirname(os.path.abspath(a.out))
     hitl = _hitl_manager(a.out) if a.chat_escalation else None
     stable_prompt = 0
@@ -732,6 +784,15 @@ def main():
         # the state the monitor found, from=None), retried until the collector
         # acknowledges it — see note_transition.
         last_state = note_transition(last_state, state, detail, kind, a.session, state_dir)
+        refused = last_refused_turn(pane or "")
+        turn_id = refused[0] if refused else None
+        if last_turn == "unseen":
+            last_turn = turn_id
+        elif refused and turn_id != last_turn:
+            last_turn = turn_id
+            pending_turn = core_turn_payload(state, refused[1], turn_id[0], a.session)
+        if pending_turn is not None and (post_core_state(pending_turn) or not obs_endpoint()):
+            pending_turn = None
 
         sig = (state, prompt, last_answered and last_answered["at"])
         if sig != last_sig:

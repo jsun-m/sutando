@@ -16,6 +16,13 @@
  *   core.session.running/idle  to=running / idle-ready              (ok)
  *   core.state.changed         anything else                        (ok)
  *
+ * The monitor also POSTs `{kind:'core.turn_refused', line, ...}` once per turn
+ * the CLI refuses outright while sitting at its idle footer (no state change):
+ *
+ *   core.auth.turn_refused     a login-class refusal line            (denied)
+ *   core.limit.turn_refused    a credits / usage-limit line          (denied)
+ *   core.turn.refused          any other refusal line                (denied)
+ *
  * Every event carries data.{from,to,detail,gate} so `core.*` is also queryable
  * as one stream. trace_id is derived from the tmux session name, never minted,
  * so a session's transitions correlate. Pure: no clock, no I/O.
@@ -35,6 +42,18 @@ export interface RawCoreState {
 	gateway_auth_rejected?: boolean;
 	ts?: number;
 }
+
+/** Raw per-occurrence payload: one refused turn while the core sat at its idle footer. */
+export interface RawCoreTurnRefused {
+	kind: 'core.turn_refused';
+	session: string;
+	line: string;
+	state?: string;
+	turn?: string;
+	ts?: number;
+}
+
+export type RawCoreRecord = RawCoreState | RawCoreTurnRefused;
 
 export interface CoreStateMapContext {
 	node: string;
@@ -81,6 +100,35 @@ function compact<T extends Record<string, unknown>>(o: T): T {
 	const out: Record<string, unknown> = {};
 	for (const [k, v] of Object.entries(o)) if (v !== undefined) out[k] = v;
 	return out as T;
+}
+
+const LOGIN_LINE = /please run \/login|not logged in|oauth access token has expired/i;
+const LIMIT_LINE = /out of usage credits|\/usage-credits|hit your (?:session|usage|weekly) limit/i;
+
+/** Kind for a refused turn, from the refusal line the CLI printed. */
+export function refusedTurnKind(line: string): string {
+	if (LOGIN_LINE.test(line)) return 'core.auth.turn_refused';
+	if (LIMIT_LINE.test(line)) return 'core.limit.turn_refused';
+	return 'core.turn.refused';
+}
+
+export function mapCoreTurnRefused(p: RawCoreTurnRefused, ctx: CoreStateMapContext): NormalizeResult {
+	const ev: ObsEvent = {
+		schema: 1,
+		ts: p.ts ?? ctx.receivedAt,
+		trace_id: `core-sess:${p.session}`,
+		node: ctx.node,
+		source: CORE_STATE_OBS_SOURCE,
+		actor: CORE_ACTOR,
+		kind: refusedTurnKind(p.line),
+		outcome: 'denied',
+		data: compact({ line: p.line, state: p.state, turn: p.turn, session: p.session }),
+	};
+	return { events: [ev], usage: [] };
+}
+
+export function mapCoreRecord(p: RawCoreRecord, ctx: CoreStateMapContext): NormalizeResult {
+	return p.kind === 'core.turn_refused' ? mapCoreTurnRefused(p, ctx) : mapCoreState(p, ctx);
 }
 
 export function mapCoreState(p: RawCoreState, ctx: CoreStateMapContext): NormalizeResult {

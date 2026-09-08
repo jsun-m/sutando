@@ -674,6 +674,72 @@ class TestCoreStateEmitter(unittest.TestCase):
         self.assertEqual(last, "running")
         self.assertEqual(calls, [])
 
+    _REFUSED_PANE = "\n".join([
+        "  ⎿ \xa0Not logged in · Please run /login", "✻ Baked for 0s · done 3:36 PM",
+        "❯ /startup", "  ⎿ \xa03 skills available", "  ⎿ \xa0Not logged in · Please run /login",
+        "✻ Cooked for 0s · done 3:50 PM", "❯ /startup", "  ⎿ \xa0Not logged in · Please run /login",
+        "✻ Worked for 0s · done 3:52 PM", "                          Not logged in · Run /login",
+        "─────────────────────────────────────── sutando-core ─", "❯\xa0",
+        "──────────────────────────────────────────────────────",
+        "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ←…"])
+
+    def test_last_refused_turn_reads_the_real_pane(self):
+        got = _mod.last_refused_turn(self._REFUSED_PANE)
+        self.assertEqual(got, (("✻ Worked for 0s · done 3:52 PM", 3), "Not logged in · Please run /login"))
+
+    def test_last_refused_turn_identity_changes_with_a_new_turn(self):
+        before = _mod.last_refused_turn(self._REFUSED_PANE)[0]
+        nxt = self._REFUSED_PANE.replace("✻ Worked for 0s · done 3:52 PM",
+                                         "✻ Worked for 0s · done 3:52 PM\n❯ /startup\n  ⎿ \xa0Not logged in · Please run /login\n✻ Worked for 0s · done 3:52 PM")
+        after = _mod.last_refused_turn(nxt)[0]
+        self.assertNotEqual(before, after, "same stamp text, one more completed turn → new identity")
+
+    def test_last_refused_turn_controls(self):
+        pane = self._REFUSED_PANE
+        # a newer prompt typed below the completion → the refusal is history
+        self.assertIsNone(_mod.last_refused_turn(pane.replace("❯\xa0", "❯ hello there")))
+        # agent output in the turn → it ran; a tool result quoting the words is the tool's
+        ran = pane.replace("❯ /startup\n  ⎿ \xa0Not logged in · Please run /login\n✻ Worked",
+                           "❯ /startup\n● Checking…\n  ⎿ \xa0Not logged in · Please run /login\n✻ Worked")
+        self.assertIsNone(_mod.last_refused_turn(ran))
+        # not at the idle footer → None
+        self.assertIsNone(_mod.last_refused_turn(_WORKING))
+        self.assertIsNone(_mod.last_refused_turn(""))
+        # a completed turn without a refusal line → None
+        ok = pane.replace("  ⎿ \xa0Not logged in · Please run /login\n✻ Worked", "  ⎿ \xa0Done.\n✻ Worked")
+        self.assertIsNone(_mod.last_refused_turn(ok))
+
+    def test_core_turn_payload_shape(self):
+        p = _mod.core_turn_payload("logged-out", "Not logged in · Please run /login",
+                                   "✻ Worked for 0s · done 3:52 PM", "sutando-core", ts=1.5)
+        self.assertEqual(p, {"kind": "core.turn_refused", "ts": 1.5, "session": "sutando-core",
+                             "state": "logged-out", "line": "Not logged in · Please run /login",
+                             "turn": "✻ Worked for 0s · done 3:52 PM"})
+
+    def test_main_once_seeds_turn_identity_without_posting_a_refusal(self):
+        import sys
+        import tempfile
+        from unittest.mock import patch
+        posted = []
+        out = os.path.join(tempfile.mkdtemp(), "core-supervisor.json")
+
+        class _RH:
+            TMUX_SOCKET = SESSION = None
+
+            def derive(self):
+                return {"health": "needs_login"}
+        argv = ["core-input-watch.py", "--socket", "/tmp/x.sock", "--out", out, "--once"]
+        with patch.object(_mod, "capture", lambda s, sess: self._REFUSED_PANE), \
+                patch.object(_mod, "_load_runtime_health", lambda: _RH()), \
+                patch.object(_mod, "gateway_alive", lambda *a: True), \
+                patch.object(_mod, "_ensure_tmux_on_path", lambda: None), \
+                patch.object(_mod, "post_core_state", lambda p, **kw: posted.append(p) or True), \
+                patch.dict(os.environ, {"SUTANDO_OBS_ENDPOINT": "http://localhost:4000"}), \
+                patch.object(sys, "argv", argv):
+            main()
+        # The refusal already on screen predates the monitor: only the state record ships.
+        self.assertEqual([p["kind"] for p in posted], ["core.state"])
+
     def test_main_once_posts_the_first_observed_state_from_none(self):
         import sys
         import tempfile

@@ -4,7 +4,7 @@ import type { ObsEvent } from '../../src/observability/events.js';
 import type { Sink } from '../../src/observability/sink.js';
 import { Collector } from '../../src/observability/collector/collector.js';
 import { CoreStateNormalizer, CORE_STATE_SOURCE } from '../../src/observability/core-state-normalizer.js';
-import { mapCoreState, coreStateKind, CORE_STATE_OBS_SOURCE } from '../../src/observability/core-state-map.js';
+import { mapCoreState, mapCoreTurnRefused, refusedTurnKind, coreStateKind, CORE_STATE_OBS_SOURCE } from '../../src/observability/core-state-map.js';
 
 const CTX = { node: 'test-node', receivedAt: 1_700_000_000 };
 const raw = (over: Record<string, unknown>) => ({ kind: 'core.state' as const, session: 'sutando-core', to: 'running', ...over });
@@ -70,6 +70,34 @@ describe('mapCoreState — event shape', () => {
 		const ev = mapCoreState(raw({ from: null, to: 'idle-ready' }), CTX).events[0];
 		assert.equal(ev.ts, CTX.receivedAt);
 		assert.equal((ev.data as Record<string, unknown>).from, null);
+	});
+});
+
+describe('refused turns — per occurrence', () => {
+	it('classifies the refusal line', () => {
+		assert.equal(refusedTurnKind('Not logged in · Please run /login'), 'core.auth.turn_refused');
+		assert.equal(refusedTurnKind('OAuth access token has expired. Re-authenticate to continue.'), 'core.auth.turn_refused');
+		assert.equal(refusedTurnKind("You're out of usage credits. Run /usage-credits to keep using Fable 5.1"), 'core.limit.turn_refused');
+		assert.equal(refusedTurnKind('You hit your weekly limit'), 'core.limit.turn_refused');
+		assert.equal(refusedTurnKind('something else entirely'), 'core.turn.refused');
+	});
+	it('maps to one denied event carrying the line, never a prompt', () => {
+		const { events, usage } = mapCoreTurnRefused(
+			{ kind: 'core.turn_refused', session: 'sutando-core', line: 'Not logged in · Please run /login', state: 'logged-out', turn: '✻ Worked for 0s · done 3:52 PM', ts: 1_700_000_001 },
+			CTX,
+		);
+		assert.equal(usage.length, 0);
+		assert.equal(events.length, 1);
+		assert.equal(events[0].kind, 'core.auth.turn_refused');
+		assert.equal(events[0].outcome, 'denied');
+		assert.equal(events[0].trace_id, 'core-sess:sutando-core');
+		assert.deepEqual(events[0].data, { line: 'Not logged in · Please run /login', state: 'logged-out', turn: '✻ Worked for 0s · done 3:52 PM', session: 'sutando-core' });
+	});
+	it('normalizer accepts it and rejects a refusal without a line', () => {
+		const n = new CoreStateNormalizer();
+		assert.equal(n.normalize({ kind: 'core.turn_refused', session: 's', line: 'Please run /login' }, CTX).events[0].kind, 'core.auth.turn_refused');
+		assert.deepEqual(n.normalize({ kind: 'core.turn_refused', session: 's' }, CTX), { events: [], usage: [] });
+		assert.deepEqual(n.normalize({ kind: 'core.turn_refused', line: 'x' }, CTX), { events: [], usage: [] });
 	});
 });
 
