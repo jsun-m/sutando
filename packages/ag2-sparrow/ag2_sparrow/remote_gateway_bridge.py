@@ -46,6 +46,9 @@ Config (env / .env):
                         credentials or tier map. Env-only by necessity: the
                         .env file cannot name its own directory.
   REMOTE_TASK_POLL_WAIT long-poll seconds (default 25)
+  AG2_PUSH_SECRET, AG2_PUSH_PORT  push delivery (push_inbox.py): both set, the broker
+                        POSTs tasks to :AG2_PUSH_PORT/v1/messages and the bridge stops
+                        long-polling; results, acks and beats still go out as before
   REMOTE_TASK_ON_TASK   optional wake command, run once per newly queued task
                         file (argv split with shlex, no shell; file path appended;
                         the task's bytes on stdin, routing headers as SPARROW_* env)
@@ -323,6 +326,7 @@ socket.getaddrinfo = _getaddrinfo_prefer_v4
 from ._dirs import task_dir as _task_dir, result_dir as _result_dir, state_dir as _state_dir
 from .chat_secret_filter import filter_chat_secrets, secret_handling_instruction
 from .task_archive import find_task_file
+from .push_inbox import PushInbox
 from .local_task_protocol import find_archived_task
 from . import (agent_identity, agent_triggers, diagnostics, gateway_credential_io, gateway_credential_sources,
                gateway_credentials, gateway_instance, local_task_protocol, routing_migrations,
@@ -10995,6 +10999,11 @@ def main() -> None:
     _maybe_start_event_channel()  # additive/opt-in/isolated — never blocks the task loop
     _results_watcher = _start_results_watcher()
     _outbound_thread = _start_outbound_worker(inflight)
+    # Push delivery (AG2_PUSH_SECRET + AG2_PUSH_PORT): rounds come from the inbox, not
+    # GET /v1/tasks; the round itself is unchanged and answers each POST once settled.
+    _push = PushInbox.from_env(_served_key, log=_log)
+    if _push is not None:
+        _push.start()
     while True:
         _stamp_loop_progress()
         try:
@@ -11024,8 +11033,11 @@ def main() -> None:
             prev_ok = poll_grace_since
             _RESP_META.last = None
             try:
-                resp = _req("GET", f"/v1/tasks?wait={_poll_wait(inflight)}{_POLL_PROOF}",
-                            timeout=POLL_WAIT + 10)
+                if _push is not None:
+                    resp = {"tasks": _push.take(_poll_wait(inflight))}
+                else:
+                    resp = _req("GET", f"/v1/tasks?wait={_poll_wait(inflight)}{_POLL_PROOF}",
+                                timeout=POLL_WAIT + 10)
                 last_poll_ok = poll_grace_since = time.time()
                 stall_anchor = time.monotonic()
                 # A completed poll remains evidence even if accepting its tasks fails.
@@ -11055,6 +11067,8 @@ def main() -> None:
             added |= _take_served_round(tasks, inflight, pending_ack, fates, dropped)
             _retry_dropped_acks(dropped, received_at, fates)
             _settle_round(fates)
+            if _push is not None:
+                _push.settle(fates)
             if added:
                 wake_outbound()          # a fresh task often precedes its ack round-trip
             abandoned_suspects = _reconcile_abandoned(inflight, abandoned_suspects)
